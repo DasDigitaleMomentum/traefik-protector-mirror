@@ -1,4 +1,4 @@
-package protector_mirror
+package traefik_protector_mirror
 
 import (
 	"context"

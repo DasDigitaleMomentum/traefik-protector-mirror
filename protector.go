@@ -1,7 +1,7 @@
-// Package protector_mirror is a Traefik middleware plugin that intercepts
+// Package traefik_protector_mirror is a Traefik middleware plugin that intercepts
 // HTTP requests, computes user fingerprints, enforces a blocklist, and
 // asynchronously forwards request events to the Collector service.
-package protector_mirror
+package traefik_protector_mirror
 
 import (
 	"bytes"
