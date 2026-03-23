@@ -1,0 +1,9 @@
+displayName: Protector Mirror
+type: middleware
+import: github.com/DasDigitaleMomentum/traefik-protector-mirror
+summary: Request interception, fingerprinting, and blocklist enforcement
+
+testData:
+  collectorURL: "http://collector:8081"
+  blocklistRefreshSec: 5
+  apiKey: "dev-key"
