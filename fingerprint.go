@@ -8,13 +8,14 @@ import (
 )
 
 // canonicalHeaders defines the ordered set of headers used for fingerprinting.
-// Must match the Collector's implementation exactly.
 var canonicalHeaders = []string{
 	"User-Agent",
-	"Accept",
 	"Accept-Language",
-	"Accept-Encoding",
+	"Sec-Ch-Ua",
+	"Sec-Ch-Ua-Mobile",
+	"Sec-Ch-Ua-Platform",
 }
+
 
 // computeFingerprint computes the fingerprint ID from client IP and request headers.
 // Algorithm: extract 4 canonical headers, normalize (trim+lowercase), join with "|",
