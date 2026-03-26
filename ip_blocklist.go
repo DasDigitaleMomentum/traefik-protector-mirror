@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -20,13 +21,36 @@ type IPBlocklist struct {
 	apiKey       string
 }
 
+var (
+	ipBlocklistRegistryMu sync.Mutex
+	ipBlocklistRegistry   = map[string]*IPBlocklist{}
+)
+
+func ipBlocklistKey(collectorURL, apiKey string, refreshSec int) string {
+	return collectorURL + "|" + apiKey + "|" + strconv.Itoa(refreshSec)
+}
+
 // NewIPBlocklist creates a new IPBlocklist and starts a background refresh loop.
 func NewIPBlocklist(collectorURL string, refreshSec int, apiKey string) *IPBlocklist {
+	if refreshSec <= 0 {
+		refreshSec = 5
+	}
+
+	key := ipBlocklistKey(collectorURL, apiKey, refreshSec)
+	ipBlocklistRegistryMu.Lock()
+	if existing, ok := ipBlocklistRegistry[key]; ok {
+		ipBlocklistRegistryMu.Unlock()
+		return existing
+	}
+
 	b := &IPBlocklist{
 		blocked:      make(map[string]bool),
 		collectorURL: collectorURL,
 		apiKey:       apiKey,
 	}
+	ipBlocklistRegistry[key] = b
+	ipBlocklistRegistryMu.Unlock()
+
 	// Attempt initial fetch (best-effort)
 	b.refresh()
 	// Start background refresh loop
