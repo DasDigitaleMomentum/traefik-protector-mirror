@@ -7,3 +7,30 @@ testData:
   collectorURL: "http://collector:8081"
   blocklistRefreshSec: 5
   apiKey: "dev-key"
+  prefilterEnabled: true
+  prefilterMode: "detect"
+  prefilterFailMode: "open"
+  prefilterRules:
+    maxURLLength: 4096
+    maxQueryLength: 2048
+    maxQueryParams: 40
+    maxHeaderValueLength: 1024
+    deniedPathPrefixes:
+      - "/.env"
+      - "/wp-admin/install.php"
+      - "/wp-admin/setup-config.php"
+      - "/wp-config.php"
+      - "/xmlrpc.php"
+      - "/vendor/phpunit"
+      - "/cgi-bin/"
+    deniedUserAgentSubstrings:
+      - "sqlmap"
+      - "nikto"
+      - "masscan"
+      - "acunetix"
+      - "nessus"
+      - "nmap scripting engine"
+      - "zgrab"
+  syncToCollectorOnPrefilterHit: true
+  emitSyntheticEventOnPrefilterHit: true
+  autoBlockFingerprintOnPrefilterHit: true

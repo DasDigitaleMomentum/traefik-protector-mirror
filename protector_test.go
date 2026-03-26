@@ -2,9 +2,11 @@ package traefik_protector_mirror
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -56,5 +58,183 @@ func TestNotifyBlockedSetsAPIKeyHeader(t *testing.T) {
 
 	if got != "dev-key" {
 		t.Fatalf("expected X-API-Key dev-key, got %q", got)
+	}
+}
+
+func TestServeHTTP_PrefilterEnforce_SyncsCollectorAndReturns403(t *testing.T) {
+	type statusCall struct {
+		path string
+		body []byte
+	}
+
+	blockedCh := make(chan []byte, 1)
+	statusCh := make(chan statusCall, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/blocklist" || r.URL.Path == "/ip-blocklist":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"blocked":[]}`))
+		case r.URL.Path == "/blocked-event":
+			body, _ := io.ReadAll(r.Body)
+			blockedCh <- body
+			w.WriteHeader(http.StatusAccepted)
+		case strings.HasPrefix(r.URL.Path, "/users/") && strings.HasSuffix(r.URL.Path, "/status"):
+			body, _ := io.ReadAll(r.Body)
+			statusCh <- statusCall{path: r.URL.Path, body: body}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	p := &ProtectorMirror{
+		next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusTeapot)
+		}),
+		config: &Config{
+			CollectorURL:                       srv.URL,
+			APIKey:                             "dev-key",
+			PrefilterEnabled:                   true,
+			PrefilterMode:                      "enforce",
+			PrefilterFailMode:                  "open",
+			PrefilterRules:                     defaultPrefilterRules(),
+			SyncToCollectorOnPrefilterHit:      true,
+			EmitSyntheticEventOnPrefilterHit:   true,
+			AutoBlockFingerprintOnPrefilterHit: true,
+		},
+		httpClient:  srv.Client(),
+		eventCh:     make(chan []byte, 4),
+		blocklist:   &Blocklist{blocked: map[string]bool{}},
+		ipBlocklist: &IPBlocklist{blocked: map[string]bool{}},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/wp-config.php", nil)
+	req.RemoteAddr = "203.0.113.10:3456"
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected status 403, got %d", rr.Code)
+	}
+
+	select {
+	case eventBody := <-p.eventCh:
+		var evt map[string]any
+		if err := json.Unmarshal(eventBody, &evt); err != nil {
+			t.Fatalf("failed to parse synthetic event JSON: %v", err)
+		}
+		if got := int(evt["status_code"].(float64)); got != http.StatusForbidden {
+			t.Fatalf("expected synthetic status_code 403, got %d", got)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for synthetic 403 event")
+	}
+
+	select {
+	case body := <-blockedCh:
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("failed to parse blocked-event JSON: %v", err)
+		}
+		if got := payload["block_reason"]; got != "prefilter" {
+			t.Fatalf("expected block_reason=prefilter, got %v", got)
+		}
+		if got := payload["precheck_rule"]; got == "" {
+			t.Fatalf("expected non-empty precheck_rule, got %v", got)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for blocked-event sync")
+	}
+
+	select {
+	case call := <-statusCh:
+		if !strings.HasPrefix(call.path, "/users/") || !strings.HasSuffix(call.path, "/status") {
+			t.Fatalf("unexpected status update path: %s", call.path)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(call.body, &payload); err != nil {
+			t.Fatalf("failed to parse status update JSON: %v", err)
+		}
+		if got := payload["status"]; got != "blocked" {
+			t.Fatalf("expected status=blocked, got %v", got)
+		}
+		if got := payload["actor"]; got != "plugin-prefilter" {
+			t.Fatalf("expected actor=plugin-prefilter, got %v", got)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for status sync")
+	}
+}
+
+func TestServeHTTP_PrefilterDetect_DoesNotBlockAndStillEnqueuesEvent(t *testing.T) {
+	blockedCh := make(chan struct{}, 1)
+	statusCh := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/blocklist" || r.URL.Path == "/ip-blocklist":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"blocked":[]}`))
+		case r.URL.Path == "/blocked-event":
+			blockedCh <- struct{}{}
+			w.WriteHeader(http.StatusAccepted)
+		case strings.HasPrefix(r.URL.Path, "/users/") && strings.HasSuffix(r.URL.Path, "/status"):
+			statusCh <- struct{}{}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	p := &ProtectorMirror{
+		next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+		config: &Config{
+			CollectorURL:                       srv.URL,
+			APIKey:                             "dev-key",
+			PrefilterEnabled:                   true,
+			PrefilterMode:                      "detect",
+			PrefilterFailMode:                  "open",
+			PrefilterRules:                     defaultPrefilterRules(),
+			SyncToCollectorOnPrefilterHit:      true,
+			EmitSyntheticEventOnPrefilterHit:   true,
+			AutoBlockFingerprintOnPrefilterHit: true,
+		},
+		httpClient:  srv.Client(),
+		eventCh:     make(chan []byte, 2),
+		blocklist:   &Blocklist{blocked: map[string]bool{}},
+		ipBlocklist: &IPBlocklist{blocked: map[string]bool{}},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/wp-config.php", nil)
+	req.RemoteAddr = "203.0.113.20:3456"
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected status 204, got %d", rr.Code)
+	}
+
+	select {
+	case <-blockedCh:
+		t.Fatal("did not expect blocked-event sync in detect mode")
+	case <-statusCh:
+		t.Fatal("did not expect status sync in detect mode")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	select {
+	case eventBody := <-p.eventCh:
+		var evt map[string]any
+		if err := json.Unmarshal(eventBody, &evt); err != nil {
+			t.Fatalf("failed to parse event JSON: %v", err)
+		}
+		if got := int(evt["status_code"].(float64)); got != http.StatusNoContent {
+			t.Fatalf("expected status_code 204, got %d", got)
+		}
+	default:
+		t.Fatal("expected event to be enqueued in detect mode")
 	}
 }
