@@ -247,7 +247,7 @@ func TestServeHTTP_PrefilterUsesDynamicRulesFromStore(t *testing.T) {
 			_, _ = w.Write([]byte(`{"blocked":[]}`))
 		case "/prefilter-config":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"rules":{"uriLengthMax":2048,"queryLengthMax":2048,"queryParamCountMax":32,"headerValueLengthMax":4096,"deniedPathPrefixes":["/dynamic-block"],"deniedUserAgentSubstrings":[]},"version":"v1","updatedAt":"2026-03-26T12:00:00Z"}`))
+			_, _ = w.Write([]byte(`{"rules":{"uriLengthMax":2048,"queryLengthMax":2048,"queryParamCountMax":32,"headerValueLengthMax":4096,"deniedPathPrefixes":["/dynamic-block"],"deniedUserAgentSubstrings":[],"deniedCountries":[]},"version":"v1","updatedAt":"2026-03-26T12:00:00Z"}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -327,5 +327,55 @@ func TestServeHTTP_PrefilterLegacyFallbackUsesStaticRulesWithoutCollectorURL(t *
 
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected static legacy prefilter to block with 403, got %d", rr.Code)
+	}
+}
+
+type stubGeoResolver struct {
+	country string
+	err     error
+	calls   int
+}
+
+func (s *stubGeoResolver) LookupCountry(_ string) (string, error) {
+	s.calls++
+	return s.country, s.err
+}
+
+func TestEvaluatePrefilter_GeoPlaceholderSkipsWhenResolverNil(t *testing.T) {
+	cfg := &Config{PrefilterEnabled: true}
+	rules := defaultPrefilterRules()
+	rules.DeniedCountries = []string{"DE"}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/ok", nil)
+	req.Header.Set("User-Agent", "mozilla")
+
+	decision, err := evaluatePrefilter(cfg, rules, nil, req)
+	if err != nil {
+		t.Fatalf("evaluatePrefilter returned error: %v", err)
+	}
+	if decision.Matched {
+		t.Fatalf("expected no geo block match in phase 3, got %+v", decision)
+	}
+}
+
+func TestEvaluatePrefilter_GeoPlaceholderSkipsEvenWithResolver(t *testing.T) {
+	cfg := &Config{PrefilterEnabled: true}
+	rules := defaultPrefilterRules()
+	rules.DeniedCountries = []string{"DE"}
+
+	resolver := &stubGeoResolver{country: "DE"}
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/ok", nil)
+	req.RemoteAddr = "203.0.113.90:1234"
+	req.Header.Set("User-Agent", "mozilla")
+
+	decision, err := evaluatePrefilter(cfg, rules, resolver, req)
+	if err != nil {
+		t.Fatalf("evaluatePrefilter returned error: %v", err)
+	}
+	if decision.Matched {
+		t.Fatalf("expected no geo block match in phase 3, got %+v", decision)
+	}
+	if resolver.calls != 0 {
+		t.Fatalf("expected resolver not to be called in phase 3, got %d calls", resolver.calls)
 	}
 }

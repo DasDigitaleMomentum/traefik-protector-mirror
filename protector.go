@@ -30,6 +30,11 @@ type Config struct {
 	AutoBlockFingerprintOnPrefilterHit bool `json:"autoBlockFingerprintOnPrefilterHit"`
 }
 
+// GeoIPResolver provides a seam for future GeoIP integration.
+type GeoIPResolver interface {
+	LookupCountry(ip string) (string, error)
+}
+
 // CreateConfig creates the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
@@ -55,6 +60,7 @@ type ProtectorMirror struct {
 	blocklist       *Blocklist
 	ipBlocklist     *IPBlocklist
 	prefilterConfig *PrefilterConfigStore
+	geoResolver     GeoIPResolver
 	eventCh         chan []byte
 	httpClient      *http.Client
 }
@@ -126,7 +132,7 @@ func (p *ProtectorMirror) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if p.prefilterConfig != nil {
 		rules = p.prefilterConfig.GetRules()
 	}
-	decision, err := evaluatePrefilter(p.config, rules, req)
+	decision, err := evaluatePrefilter(p.config, rules, p.geoResolver, req)
 	if err != nil {
 		if p.config.prefilterFailClosed() {
 			decision = prefilterDecision{Matched: true, Rule: "prefilter_error", Reason: "prefilter evaluation failed"}

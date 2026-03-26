@@ -2,6 +2,7 @@ package traefik_protector_mirror
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -31,6 +32,7 @@ type PrefilterRules struct {
 	HeaderValueLengthMax int      `json:"headerValueLengthMax"`
 	DeniedPathPrefixes   []string `json:"deniedPathPrefixes"`
 	DeniedUserAgentSubs  []string `json:"deniedUserAgentSubstrings"`
+	DeniedCountries      []string `json:"deniedCountries"`
 }
 
 type prefilterDecision struct {
@@ -52,6 +54,7 @@ func defaultPrefilterRules() PrefilterRules {
 		HeaderValueLengthMax: 4096,
 		DeniedPathPrefixes:   pathPrefixes,
 		DeniedUserAgentSubs:  uaSubs,
+		DeniedCountries:      []string{},
 	}
 }
 
@@ -67,7 +70,7 @@ func (c *Config) prefilterFailClosed() bool {
 	return strings.EqualFold(strings.TrimSpace(c.PrefilterFailMode), "closed")
 }
 
-func evaluatePrefilter(cfg *Config, rules PrefilterRules, req *http.Request) (prefilterDecision, error) {
+func evaluatePrefilter(cfg *Config, rules PrefilterRules, _ GeoIPResolver, req *http.Request) (prefilterDecision, error) {
 	if cfg == nil || !cfg.PrefilterEnabled {
 		return prefilterDecision{}, nil
 	}
@@ -125,6 +128,10 @@ func evaluatePrefilter(cfg *Config, rules PrefilterRules, req *http.Request) (pr
 		if strings.Contains(uaLower, normalized) {
 			return prefilterDecision{Matched: true, Rule: "denied_user_agent", Reason: fmt.Sprintf("user-agent contains denied token %s", normalized)}, nil
 		}
+	}
+
+	if len(rules.DeniedCountries) > 0 {
+		log.Printf("[protector-mirror] GeoIP not available, skipping geo-block")
 	}
 
 	return prefilterDecision{}, nil

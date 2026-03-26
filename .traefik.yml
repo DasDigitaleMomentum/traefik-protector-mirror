@@ -32,6 +32,9 @@ testData:
       - "nessus"
       - "nmap scripting engine"
       - "zgrab"
+    deniedCountries:
+      - "DE"
+      - "US"
   syncToCollectorOnPrefilterHit: true
   emitSyntheticEventOnPrefilterHit: true
   autoBlockFingerprintOnPrefilterHit: true

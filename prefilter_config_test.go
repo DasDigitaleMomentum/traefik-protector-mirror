@@ -14,7 +14,7 @@ func TestPrefilterConfigRefreshSendsAPIKeyHeaderAndQuery(t *testing.T) {
 		gotHeader = r.Header.Get("X-API-Key")
 		gotQuery = r.URL.Query().Get("apiKey")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"rules":{"uriLengthMax":2048,"queryLengthMax":2048,"queryParamCountMax":32,"headerValueLengthMax":4096,"deniedPathPrefixes":["/foo"],"deniedUserAgentSubstrings":["bar"]},"version":"v1","updatedAt":"2026-03-26T12:00:00Z"}`))
+		_, _ = w.Write([]byte(`{"rules":{"uriLengthMax":2048,"queryLengthMax":2048,"queryParamCountMax":32,"headerValueLengthMax":4096,"deniedPathPrefixes":["/foo"],"deniedUserAgentSubstrings":["bar"],"deniedCountries":["DE","US"]},"version":"v1","updatedAt":"2026-03-26T12:00:00Z"}`))
 	}))
 	defer srv.Close()
 
@@ -31,6 +31,9 @@ func TestPrefilterConfigRefreshSendsAPIKeyHeaderAndQuery(t *testing.T) {
 	rules := s.GetRules()
 	if len(rules.DeniedPathPrefixes) != 1 || rules.DeniedPathPrefixes[0] != "/foo" {
 		t.Fatalf("expected refreshed denied paths from collector, got %+v", rules.DeniedPathPrefixes)
+	}
+	if len(rules.DeniedCountries) != 2 || rules.DeniedCountries[0] != "DE" || rules.DeniedCountries[1] != "US" {
+		t.Fatalf("expected refreshed denied countries from collector, got %+v", rules.DeniedCountries)
 	}
 }
 

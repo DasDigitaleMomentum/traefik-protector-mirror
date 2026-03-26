@@ -76,6 +76,7 @@ func (s *PrefilterConfigStore) GetRules() PrefilterRules {
 	rules := s.rules
 	rules.DeniedPathPrefixes = append([]string(nil), s.rules.DeniedPathPrefixes...)
 	rules.DeniedUserAgentSubs = append([]string(nil), s.rules.DeniedUserAgentSubs...)
+	rules.DeniedCountries = append([]string(nil), s.rules.DeniedCountries...)
 	return rules
 }
 
@@ -159,5 +160,6 @@ func isZeroPrefilterRules(r PrefilterRules) bool {
 		r.QueryParamCountMax == 0 &&
 		r.HeaderValueLengthMax == 0 &&
 		len(r.DeniedPathPrefixes) == 0 &&
-		len(r.DeniedUserAgentSubs) == 0
+		len(r.DeniedUserAgentSubs) == 0 &&
+		len(r.DeniedCountries) == 0
 }

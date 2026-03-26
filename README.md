@@ -1,28 +1,51 @@
 # Protector Mirror — Traefik Middleware Plugin
 
-A lightweight Web Application Firewall (WAF) for [Traefik](https://traefik.io/) that sits in the request path, fingerprints every visitor, and enforces blocklists in real time.
+Protector Mirror is a Traefik middleware plugin for edge-side security enforcement.
+It fingerprints incoming requests, applies lightweight prefilter checks, enforces blocklists,
+and asynchronously reports events to the Collector.
 
-Built for hybrid detection — rule-based analysis today, AI-powered classification on the roadmap.
+## Current capabilities
 
-> ⚠️ **Early access.** Protector Mirror is under active development. A public release with full documentation will follow here. Until then, this plugin is designed to work with the Protector backend stack and is not standalone.
+- Request fingerprinting from canonical headers
+- Fingerprint blocklist enforcement (`/blocklist`)
+- IP blocklist enforcement (`/ip-blocklist`)
+- Dynamic prefilter config polling (`/prefilter-config`)
+- Prefilter modes:
+  - `detect`: log/observe prefilter hits, continue request
+  - `enforce`: return `403` on prefilter match
 
----
+## Dynamic config behavior
 
-## What it does
+The plugin supports dynamic rule refresh from Collector for prefilter rules and keeps stale data on refresh errors.
 
-This Traefik middleware intercepts incoming HTTP requests and:
+- Blocklists refresh via `blocklistRefreshSec`
+- Prefilter rules refresh via `prefilterRefreshSec`
+- API key is forwarded as `X-API-Key` header (and `apiKey` query for blocklist/prefilter GET endpoints)
 
-1. **Computes a browser fingerprint** from a canonical set of request headers
-2. **Checks fingerprint and IP blocklists** with automatic background refresh
-3. **Blocks known bad actors** immediately (returns `403 Forbidden`)
-4. **Forwards request events** asynchronously to the Collector for analysis
+## Prefilter rules
 
-All of this happens at the edge — before your application sees the request.
+Current prefilter schema:
 
-## Configuration
+- `uriLengthMax`
+- `queryLengthMax`
+- `queryParamCountMax`
+- `headerValueLengthMax`
+- `deniedPathPrefixes`
+- `deniedUserAgentSubstrings`
+- `deniedCountries` (Phase 3 placeholder)
+
+### Geo-block placeholder (Phase 3)
+
+`deniedCountries` is intentionally a data-model placeholder in Phase 3.
+
+- Geo evaluation is **always skipped** in Phase 3.
+- This is true even if a `GeoIPResolver` instance exists.
+- The plugin logs: `GeoIP not available, skipping geo-block`.
+- No country lookup or geo-based deny decision is executed in Phase 3.
+
+## Example Traefik dynamic config
 
 ```yaml
-# Traefik dynamic configuration
 http:
   middlewares:
     protector:
@@ -30,40 +53,31 @@ http:
         protector-mirror:
           collectorURL: "http://collector:8081"
           blocklistRefreshSec: 5
+          prefilterRefreshSec: 30
           apiKey: "your-api-key"
+          prefilterEnabled: true
+          prefilterMode: "detect"
+          prefilterFailMode: "open"
 ```
 
+## Main settings
+
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `collectorURL` | string | `http://collector:8081` | Collector service endpoint |
-| `blocklistRefreshSec` | int | `5` | Blocklist polling interval in seconds |
-| `apiKey` | string | `""` | API key for Collector authentication |
-
-## How it works
-
-The plugin runs as Traefik middleware — no sidecar, no external process. Blocklists are cached in memory and refreshed on a configurable interval. Event dispatch to the Collector is non-blocking (buffered channel with async workers), so request latency stays minimal.
-
-Fingerprints are deterministic: same headers, same fingerprint. The Collector aggregates these signals, and the Probe service evaluates rules to decide who gets blocked.
+|---|---|---|---|
+| `collectorURL` | string | `http://collector:8081` | Collector base URL |
+| `blocklistRefreshSec` | int | `5` | Blocklist/IP-blocklist refresh interval |
+| `prefilterRefreshSec` | int | `30` | Prefilter config refresh interval |
+| `apiKey` | string | `""` | Collector authentication key |
+| `prefilterEnabled` | bool | `true` | Enable prefilter checks |
+| `prefilterMode` | string | `detect` | `detect` or `enforce` |
+| `prefilterFailMode` | string | `open` | `open` or `closed` on prefilter evaluation error |
 
 ## Requirements
 
 - Traefik v3.x
-- A running Protector backend (Collector + Redis, at minimum)
-
-## Stack
-
-Protector Mirror is one piece of a larger system:
-
-- **This plugin** — request interception at the Traefik edge
-- **Collector** — event ingestion, fingerprint storage, blocklist management
-- **Probe** — rule engine for automated threat evaluation
-- **Dashboard** — real-time monitoring UI with WebSocket live feed
-
-Full stack documentation will be published when the project goes public.
+- Protector backend (Collector + Redis)
 
 ## License
 
 [Business Source License 1.1](LICENSE) — free to use for non-production purposes.  
 Changes to [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0) on 2030-03-23.
-
-Copyright © 2026 DasDigitaleMomentum
