@@ -1,9 +1,12 @@
 package traefik_protector_mirror
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -341,41 +344,190 @@ func (s *stubGeoResolver) LookupCountry(_ string) (string, error) {
 	return s.country, s.err
 }
 
-func TestEvaluatePrefilter_GeoPlaceholderSkipsWhenResolverNil(t *testing.T) {
-	cfg := &Config{PrefilterEnabled: true}
+func TestEvaluatePrefilter_GeoBlocksDeniedCountry(t *testing.T) {
+	cfg := &Config{PrefilterEnabled: true, PrefilterFailMode: "open"}
 	rules := defaultPrefilterRules()
 	rules.DeniedCountries = []string{"DE"}
+	rules.DeniedPathPrefixes = nil
 
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/ok", nil)
 	req.Header.Set("User-Agent", "mozilla")
+	resolver := &stubGeoResolver{country: "de"}
 
-	decision, err := evaluatePrefilter(cfg, rules, nil, req)
+	decision, err := evaluatePrefilter(cfg, rules, resolver, "203.0.113.10", req)
 	if err != nil {
 		t.Fatalf("evaluatePrefilter returned error: %v", err)
 	}
-	if decision.Matched {
-		t.Fatalf("expected no geo block match in phase 3, got %+v", decision)
+	if !decision.Matched || decision.Rule != "denied_country" {
+		t.Fatalf("expected denied_country match, got %+v", decision)
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("expected resolver to be called once, got %d", resolver.calls)
 	}
 }
 
-func TestEvaluatePrefilter_GeoPlaceholderSkipsEvenWithResolver(t *testing.T) {
-	cfg := &Config{PrefilterEnabled: true}
+func TestEvaluatePrefilter_GeoAllowsNonDeniedCountry(t *testing.T) {
+	cfg := &Config{PrefilterEnabled: true, PrefilterFailMode: "open"}
 	rules := defaultPrefilterRules()
 	rules.DeniedCountries = []string{"DE"}
+	rules.DeniedPathPrefixes = nil
 
-	resolver := &stubGeoResolver{country: "DE"}
+	resolver := &stubGeoResolver{country: "US"}
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/ok", nil)
 	req.RemoteAddr = "203.0.113.90:1234"
 	req.Header.Set("User-Agent", "mozilla")
 
-	decision, err := evaluatePrefilter(cfg, rules, resolver, req)
+	decision, err := evaluatePrefilter(cfg, rules, resolver, "203.0.113.90", req)
 	if err != nil {
 		t.Fatalf("evaluatePrefilter returned error: %v", err)
 	}
 	if decision.Matched {
-		t.Fatalf("expected no geo block match in phase 3, got %+v", decision)
+		t.Fatalf("expected no geo block match, got %+v", decision)
 	}
-	if resolver.calls != 0 {
-		t.Fatalf("expected resolver not to be called in phase 3, got %d calls", resolver.calls)
+	if resolver.calls != 1 {
+		t.Fatalf("expected resolver to be called once, got %d", resolver.calls)
+	}
+}
+
+func TestEvaluatePrefilter_GeoFailOpenOnResolverError(t *testing.T) {
+	cfg := &Config{PrefilterEnabled: true, PrefilterFailMode: "open"}
+	rules := defaultPrefilterRules()
+	rules.DeniedCountries = []string{"DE"}
+	rules.DeniedPathPrefixes = nil
+
+	resolver := &stubGeoResolver{err: errors.New("timeout")}
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/ok", nil)
+
+	decision, err := evaluatePrefilter(cfg, rules, resolver, "203.0.113.11", req)
+	if err != nil {
+		t.Fatalf("evaluatePrefilter returned error: %v", err)
+	}
+	if decision.Matched {
+		t.Fatalf("expected fail-open to pass request, got %+v", decision)
+	}
+}
+
+func TestEvaluatePrefilter_GeoFailClosedOnResolverError(t *testing.T) {
+	cfg := &Config{PrefilterEnabled: true, PrefilterFailMode: "closed"}
+	rules := defaultPrefilterRules()
+	rules.DeniedCountries = []string{"DE"}
+	rules.DeniedPathPrefixes = nil
+
+	resolver := &stubGeoResolver{err: errors.New("timeout")}
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/ok", nil)
+
+	decision, err := evaluatePrefilter(cfg, rules, resolver, "203.0.113.12", req)
+	if err != nil {
+		t.Fatalf("evaluatePrefilter returned error: %v", err)
+	}
+	if !decision.Matched || decision.Rule != "denied_country" {
+		t.Fatalf("expected fail-closed denied_country match, got %+v", decision)
+	}
+}
+
+func TestEvaluatePrefilter_BlocksDeniedPathRegex(t *testing.T) {
+	cfg := &Config{PrefilterEnabled: true}
+	rules := defaultPrefilterRules()
+	rules.DeniedPathPrefixes = nil
+	rules.DeniedPathRegexes = []string{`^/api/v[0-9]+/admin`}
+	prepared, err := prepareRulesForStorage(rules)
+	if err != nil {
+		t.Fatalf("prepareRulesForStorage returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/api/v2/admin/panel", nil)
+	decision, err := evaluatePrefilter(cfg, prepared, nil, "203.0.113.13", req)
+	if err != nil {
+		t.Fatalf("evaluatePrefilter returned error: %v", err)
+	}
+	if !decision.Matched || decision.Rule != "denied_path_regex" {
+		t.Fatalf("expected denied_path_regex match, got %+v", decision)
+	}
+}
+
+func TestResolveClientIP_UsesForwardHeadersForTrustedProxy(t *testing.T) {
+	nets, err := parseTrustedProxyCIDRs([]string{"10.0.0.0/8"})
+	if err != nil {
+		t.Fatalf("parseTrustedProxyCIDRs returned error: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/ok", nil)
+	req.RemoteAddr = "10.1.2.3:1234"
+	req.Header.Set("X-Real-IP", "203.0.113.100")
+	req.Header.Set("X-Forwarded-For", "203.0.113.101")
+
+	got := resolveClientIP(req, nets)
+	if got != "203.0.113.100" {
+		t.Fatalf("expected trusted proxy to use X-Real-IP, got %q", got)
+	}
+}
+
+func TestResolveClientIP_IgnoresForwardHeadersForUntrustedProxy(t *testing.T) {
+	nets, err := parseTrustedProxyCIDRs([]string{"10.0.0.0/8"})
+	if err != nil {
+		t.Fatalf("parseTrustedProxyCIDRs returned error: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/ok", nil)
+	req.RemoteAddr = "198.51.100.2:2345"
+	req.Header.Set("X-Real-IP", "203.0.113.100")
+	req.Header.Set("X-Forwarded-For", "203.0.113.101")
+
+	got := resolveClientIP(req, nets)
+	if got != "198.51.100.2" {
+		t.Fatalf("expected untrusted proxy to fall back to remote addr, got %q", got)
+	}
+}
+
+type fakeRWWithAllInterfaces struct {
+	headers    http.Header
+	flushCalls int
+	pushCalls  int
+	closeCh    chan bool
+}
+
+func (f *fakeRWWithAllInterfaces) Header() http.Header {
+	if f.headers == nil {
+		f.headers = make(http.Header)
+	}
+	return f.headers
+}
+func (f *fakeRWWithAllInterfaces) Write(b []byte) (int, error) { return len(b), nil }
+func (f *fakeRWWithAllInterfaces) WriteHeader(_ int)           {}
+func (f *fakeRWWithAllInterfaces) Flush()                      { f.flushCalls++ }
+func (f *fakeRWWithAllInterfaces) Push(_ string, _ *http.PushOptions) error {
+	f.pushCalls++
+	return nil
+}
+func (f *fakeRWWithAllInterfaces) CloseNotify() <-chan bool {
+	if f.closeCh == nil {
+		f.closeCh = make(chan bool)
+	}
+	return f.closeCh
+}
+func (f *fakeRWWithAllInterfaces) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, nil
+}
+
+func TestStatusCapture_InterfacePassthrough(t *testing.T) {
+	base := &fakeRWWithAllInterfaces{}
+	sc := &statusCapture{ResponseWriter: base, statusCode: 200}
+
+	sc.Flush()
+	if base.flushCalls != 1 {
+		t.Fatalf("expected Flush passthrough call, got %d", base.flushCalls)
+	}
+
+	if err := sc.Push("/resource", nil); err != nil {
+		t.Fatalf("expected Push passthrough success, got %v", err)
+	}
+	if base.pushCalls != 1 {
+		t.Fatalf("expected Push passthrough call, got %d", base.pushCalls)
+	}
+
+	if _, _, err := sc.Hijack(); err != nil {
+		t.Fatalf("expected Hijack passthrough success, got %v", err)
+	}
+
+	if ch := sc.CloseNotify(); ch == nil {
+		t.Fatal("expected CloseNotify channel")
 	}
 }

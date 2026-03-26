@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -31,8 +32,11 @@ type PrefilterRules struct {
 	QueryParamCountMax   int      `json:"queryParamCountMax"`
 	HeaderValueLengthMax int      `json:"headerValueLengthMax"`
 	DeniedPathPrefixes   []string `json:"deniedPathPrefixes"`
+	DeniedPathRegexes    []string `json:"deniedPathRegexes"`
 	DeniedUserAgentSubs  []string `json:"deniedUserAgentSubstrings"`
 	DeniedCountries      []string `json:"deniedCountries"`
+
+	compiledDeniedPathRegexes []*regexp.Regexp `json:"-"`
 }
 
 type prefilterDecision struct {
@@ -53,6 +57,7 @@ func defaultPrefilterRules() PrefilterRules {
 		QueryParamCountMax:   32,
 		HeaderValueLengthMax: 4096,
 		DeniedPathPrefixes:   pathPrefixes,
+		DeniedPathRegexes:    []string{},
 		DeniedUserAgentSubs:  uaSubs,
 		DeniedCountries:      []string{},
 	}
@@ -70,7 +75,7 @@ func (c *Config) prefilterFailClosed() bool {
 	return strings.EqualFold(strings.TrimSpace(c.PrefilterFailMode), "closed")
 }
 
-func evaluatePrefilter(cfg *Config, rules PrefilterRules, _ GeoIPResolver, req *http.Request) (prefilterDecision, error) {
+func evaluatePrefilter(cfg *Config, rules PrefilterRules, resolver GeoIPResolver, clientIP string, req *http.Request) (prefilterDecision, error) {
 	if cfg == nil || !cfg.PrefilterEnabled {
 		return prefilterDecision{}, nil
 	}
@@ -119,6 +124,12 @@ func evaluatePrefilter(cfg *Config, rules PrefilterRules, _ GeoIPResolver, req *
 		}
 	}
 
+	for _, pattern := range rules.compiledDeniedPathRegexes {
+		if pattern.MatchString(req.URL.Path) {
+			return prefilterDecision{Matched: true, Rule: "denied_path_regex", Reason: fmt.Sprintf("path matched denied regex %s", pattern.String())}, nil
+		}
+	}
+
 	uaLower := strings.ToLower(req.Header.Get("User-Agent"))
 	for _, sub := range rules.DeniedUserAgentSubs {
 		normalized := strings.ToLower(strings.TrimSpace(sub))
@@ -131,7 +142,36 @@ func evaluatePrefilter(cfg *Config, rules PrefilterRules, _ GeoIPResolver, req *
 	}
 
 	if len(rules.DeniedCountries) > 0 {
-		log.Printf("[protector-mirror] GeoIP not available, skipping geo-block")
+		if resolver == nil {
+			if cfg.prefilterFailClosed() {
+				return prefilterDecision{Matched: true, Rule: "denied_country", Reason: "geoip resolver unavailable"}, nil
+			}
+			log.Printf("[protector-mirror] GeoIP resolver unavailable, skipping geo-block (fail-open)")
+			return prefilterDecision{}, nil
+		}
+
+		if strings.TrimSpace(clientIP) == "" {
+			if cfg.prefilterFailClosed() {
+				return prefilterDecision{Matched: true, Rule: "denied_country", Reason: "client IP unavailable for geoip lookup"}, nil
+			}
+			log.Printf("[protector-mirror] client IP unavailable for geoip lookup, skipping geo-block (fail-open)")
+			return prefilterDecision{}, nil
+		}
+
+		countryCode, err := resolver.LookupCountry(clientIP)
+		if err != nil {
+			if cfg.prefilterFailClosed() {
+				return prefilterDecision{Matched: true, Rule: "denied_country", Reason: "geoip lookup failed"}, nil
+			}
+			log.Printf("[protector-mirror] GeoIP lookup failed for %s (fail-open): %v", clientIP, err)
+			return prefilterDecision{}, nil
+		}
+
+		for _, denied := range rules.DeniedCountries {
+			if strings.EqualFold(strings.TrimSpace(denied), strings.TrimSpace(countryCode)) {
+				return prefilterDecision{Matched: true, Rule: "denied_country", Reason: fmt.Sprintf("country %s is denied", strings.ToUpper(strings.TrimSpace(countryCode)))}, nil
+			}
+		}
 	}
 
 	return prefilterDecision{}, nil

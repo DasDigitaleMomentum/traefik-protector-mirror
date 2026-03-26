@@ -7,7 +7,9 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -52,9 +54,14 @@ func NewPrefilterConfigStore(collectorURL string, refreshSec int, apiKey string,
 	if isZeroPrefilterRules(initialRules) {
 		initialRules = defaultPrefilterRules()
 	}
+	preparedInitialRules, err := prepareRulesForStorage(initialRules)
+	if err != nil {
+		log.Printf("[prefilter-config] invalid initial fallback rules: %v; using defaults", err)
+		preparedInitialRules, _ = prepareRulesForStorage(defaultPrefilterRules())
+	}
 
 	s := &PrefilterConfigStore{
-		rules:        initialRules,
+		rules:        preparedInitialRules,
 		collectorURL: collectorURL,
 		apiKey:       apiKey,
 	}
@@ -75,8 +82,10 @@ func (s *PrefilterConfigStore) GetRules() PrefilterRules {
 
 	rules := s.rules
 	rules.DeniedPathPrefixes = append([]string(nil), s.rules.DeniedPathPrefixes...)
+	rules.DeniedPathRegexes = append([]string(nil), s.rules.DeniedPathRegexes...)
 	rules.DeniedUserAgentSubs = append([]string(nil), s.rules.DeniedUserAgentSubs...)
 	rules.DeniedCountries = append([]string(nil), s.rules.DeniedCountries...)
+	rules.compiledDeniedPathRegexes = append([]*regexp.Regexp(nil), s.rules.compiledDeniedPathRegexes...)
 	return rules
 }
 
@@ -146,8 +155,19 @@ func (s *PrefilterConfigStore) refresh() {
 		return
 	}
 
+	s.mu.RLock()
+	baseline := s.rules
+	s.mu.RUnlock()
+
+	merged := mergePrefilterRules(baseline, parsedRules)
+	preparedRules, err := prepareRulesForStorage(merged)
+	if err != nil {
+		log.Printf("[prefilter-config] invalid merged rules: %v (keeping stale data)", err)
+		return
+	}
+
 	s.mu.Lock()
-	s.rules = parsedRules
+	s.rules = preparedRules
 	s.lastVersion = envelope.Version
 	s.mu.Unlock()
 
@@ -160,6 +180,72 @@ func isZeroPrefilterRules(r PrefilterRules) bool {
 		r.QueryParamCountMax == 0 &&
 		r.HeaderValueLengthMax == 0 &&
 		len(r.DeniedPathPrefixes) == 0 &&
+		len(r.DeniedPathRegexes) == 0 &&
 		len(r.DeniedUserAgentSubs) == 0 &&
 		len(r.DeniedCountries) == 0
+}
+
+func mergePrefilterRules(base PrefilterRules, incoming PrefilterRules) PrefilterRules {
+	merged := base
+
+	if incoming.URILengthMax > 0 {
+		merged.URILengthMax = incoming.URILengthMax
+	}
+	if incoming.QueryLengthMax > 0 {
+		merged.QueryLengthMax = incoming.QueryLengthMax
+	}
+	if incoming.QueryParamCountMax > 0 {
+		merged.QueryParamCountMax = incoming.QueryParamCountMax
+	}
+	if incoming.HeaderValueLengthMax > 0 {
+		merged.HeaderValueLengthMax = incoming.HeaderValueLengthMax
+	}
+	if len(incoming.DeniedPathPrefixes) > 0 {
+		merged.DeniedPathPrefixes = append([]string(nil), incoming.DeniedPathPrefixes...)
+	}
+	if len(incoming.DeniedPathRegexes) > 0 {
+		merged.DeniedPathRegexes = append([]string(nil), incoming.DeniedPathRegexes...)
+	}
+	if len(incoming.DeniedUserAgentSubs) > 0 {
+		merged.DeniedUserAgentSubs = append([]string(nil), incoming.DeniedUserAgentSubs...)
+	}
+	if len(incoming.DeniedCountries) > 0 {
+		merged.DeniedCountries = append([]string(nil), incoming.DeniedCountries...)
+	}
+
+	return merged
+}
+
+func prepareRulesForStorage(rules PrefilterRules) (PrefilterRules, error) {
+	rules.DeniedPathPrefixes = normalizeStringList(rules.DeniedPathPrefixes)
+	rules.DeniedPathRegexes = normalizeStringList(rules.DeniedPathRegexes)
+	rules.DeniedUserAgentSubs = normalizeStringList(rules.DeniedUserAgentSubs)
+	rules.DeniedCountries = normalizeStringList(rules.DeniedCountries)
+
+	compiled := make([]*regexp.Regexp, 0, len(rules.DeniedPathRegexes))
+	for _, expr := range rules.DeniedPathRegexes {
+		re, err := regexp.Compile(expr)
+		if err != nil {
+			return PrefilterRules{}, fmt.Errorf("invalid deniedPathRegex %q: %w", expr, err)
+		}
+		compiled = append(compiled, re)
+	}
+	rules.compiledDeniedPathRegexes = compiled
+
+	return rules, nil
+}
+
+func normalizeStringList(values []string) []string {
+	if len(values) == 0 {
+		return []string{}
+	}
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		normalized = append(normalized, trimmed)
+	}
+	return normalized
 }

@@ -160,3 +160,55 @@ func TestPrefilterConfigStoreRejectsMissingRulesEnvelope(t *testing.T) {
 		t.Fatalf("expected fallback/stale rules to remain when rules envelope missing")
 	}
 }
+
+func TestPrefilterConfigStoreRefreshMergesSparseRulesOntoBaseline(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"rules":{"deniedCountries":["DE"]},"version":"v2","updatedAt":"2026-03-26T12:00:00Z"}`))
+	}))
+	defer srv.Close()
+
+	fallback := defaultPrefilterRules()
+	fallback.URILengthMax = 4096
+	fallback.DeniedPathPrefixes = []string{"/keep"}
+	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: fallback}
+
+	s.refresh()
+	rules := s.GetRules()
+
+	if rules.URILengthMax != 4096 {
+		t.Fatalf("expected baseline uriLengthMax to be preserved, got %d", rules.URILengthMax)
+	}
+	if firstOrEmpty(rules.DeniedPathPrefixes) != "/keep" {
+		t.Fatalf("expected baseline deniedPathPrefixes to be preserved, got %+v", rules.DeniedPathPrefixes)
+	}
+	if firstOrEmpty(rules.DeniedCountries) != "DE" {
+		t.Fatalf("expected deniedCountries override to apply, got %+v", rules.DeniedCountries)
+	}
+}
+
+func TestPrefilterConfigStoreRefreshRejectsInvalidRegexKeepsStale(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"rules":{"deniedPathRegexes":["[invalid"]},"version":"v2","updatedAt":"2026-03-26T12:00:00Z"}`))
+	}))
+	defer srv.Close()
+
+	fallback := defaultPrefilterRules()
+	fallback.DeniedPathPrefixes = []string{"/stale"}
+	preparedFallback, err := prepareRulesForStorage(fallback)
+	if err != nil {
+		t.Fatalf("prepareRulesForStorage fallback error: %v", err)
+	}
+	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: preparedFallback}
+
+	s.refresh()
+	rules := s.GetRules()
+
+	if firstOrEmpty(rules.DeniedPathPrefixes) != "/stale" {
+		t.Fatalf("expected stale rules to remain after invalid regex refresh, got %+v", rules.DeniedPathPrefixes)
+	}
+	if len(rules.DeniedPathRegexes) != 0 {
+		t.Fatalf("expected invalid regex update to be rejected, got %+v", rules.DeniedPathRegexes)
+	}
+}

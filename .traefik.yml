@@ -5,9 +5,16 @@ summary: Request interception, fingerprinting, and blocklist enforcement
 
 testData:
   collectorURL: "http://collector:8081"
+  geoIPServiceURL: "http://geoip:8080"
   blocklistRefreshSec: 5
   prefilterRefreshSec: 30
   apiKey: "dev-key"
+  trustedProxyCIDRs:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+    - "::1/128"
+    - "fc00::/7"
   prefilterEnabled: true
   prefilterMode: "detect"
   prefilterFailMode: "open"
@@ -24,6 +31,8 @@ testData:
       - "/xmlrpc.php"
       - "/vendor/phpunit"
       - "/cgi-bin/"
+    deniedPathRegexes:
+      - "^/api/v[0-9]+/admin"
     deniedUserAgentSubstrings:
       - "sqlmap"
       - "nikto"

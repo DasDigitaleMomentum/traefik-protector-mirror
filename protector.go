@@ -4,22 +4,35 @@
 package traefik_protector_mirror
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
+var defaultTrustedProxyCIDRs = []string{
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"::1/128",
+	"fc00::/7",
+}
+
 // Config holds the plugin configuration from Traefik dynamic config.
 type Config struct {
 	CollectorURL        string         `json:"collectorURL"`
+	GeoIPServiceURL     string         `json:"geoIPServiceURL"`
 	BlocklistRefreshSec int            `json:"blocklistRefreshSec"`
 	PrefilterRefreshSec int            `json:"prefilterRefreshSec"`
 	APIKey              string         `json:"apiKey"`
+	TrustedProxyCIDRs   []string       `json:"trustedProxyCIDRs"`
 	PrefilterEnabled    bool           `json:"prefilterEnabled"`
 	PrefilterMode       string         `json:"prefilterMode"`
 	PrefilterFailMode   string         `json:"prefilterFailMode"`
@@ -39,9 +52,11 @@ type GeoIPResolver interface {
 func CreateConfig() *Config {
 	return &Config{
 		CollectorURL:                       "http://collector:8081",
+		GeoIPServiceURL:                    "",
 		BlocklistRefreshSec:                5,
 		PrefilterRefreshSec:                30,
 		APIKey:                             "",
+		TrustedProxyCIDRs:                  append([]string(nil), defaultTrustedProxyCIDRs...),
 		PrefilterEnabled:                   true,
 		PrefilterMode:                      "detect",
 		PrefilterFailMode:                  "open",
@@ -54,15 +69,60 @@ func CreateConfig() *Config {
 
 // ProtectorMirror is the middleware struct.
 type ProtectorMirror struct {
-	next            http.Handler
-	name            string
-	config          *Config
-	blocklist       *Blocklist
-	ipBlocklist     *IPBlocklist
-	prefilterConfig *PrefilterConfigStore
-	geoResolver     GeoIPResolver
-	eventCh         chan []byte
-	httpClient      *http.Client
+	next             http.Handler
+	name             string
+	config           *Config
+	blocklist        *Blocklist
+	ipBlocklist      *IPBlocklist
+	prefilterConfig  *PrefilterConfigStore
+	geoResolver      GeoIPResolver
+	trustedProxyNets []*net.IPNet
+	eventCh          chan []byte
+	httpClient       *http.Client
+}
+
+type httpGeoIPResolver struct {
+	baseURL    string
+	httpClient *http.Client
+}
+
+type geoIPLookupResponse struct {
+	CountryCode string `json:"countryCode"`
+}
+
+func (r *httpGeoIPResolver) LookupCountry(ip string) (string, error) {
+	trimmedIP := strings.TrimSpace(ip)
+	if trimmedIP == "" {
+		return "", fmt.Errorf("missing ip for geoip lookup")
+	}
+
+	requestURL := strings.TrimRight(r.baseURL, "/") + "/lookup/" + url.PathEscape(trimmedIP)
+	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("geoip lookup returned status %d", resp.StatusCode)
+	}
+
+	var out geoIPLookupResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+
+	countryCode := strings.TrimSpace(out.CountryCode)
+	if countryCode == "" {
+		return "", fmt.Errorf("geoip response missing countryCode")
+	}
+
+	return strings.ToUpper(countryCode), nil
 }
 
 // eventPayload is the JSON sent to the Collector (matches Event Schema in plan.md).
@@ -106,6 +166,28 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		httpClient: &http.Client{Timeout: 2 * time.Second},
 	}
 
+	if len(config.TrustedProxyCIDRs) == 0 {
+		config.TrustedProxyCIDRs = append([]string(nil), defaultTrustedProxyCIDRs...)
+	}
+	trustedNets, err := parseTrustedProxyCIDRs(config.TrustedProxyCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	p.trustedProxyNets = trustedNets
+
+	preparedRules, err := prepareRulesForStorage(config.PrefilterRules)
+	if err != nil {
+		return nil, err
+	}
+	config.PrefilterRules = preparedRules
+
+	if strings.TrimSpace(config.GeoIPServiceURL) != "" {
+		p.geoResolver = &httpGeoIPResolver{
+			baseURL:    config.GeoIPServiceURL,
+			httpClient: p.httpClient,
+		}
+	}
+
 	// Start blocklist refresh
 	p.blocklist = NewBlocklist(config.CollectorURL, config.BlocklistRefreshSec, config.APIKey)
 
@@ -125,14 +207,14 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 // ServeHTTP is the middleware handler.
 func (p *ProtectorMirror) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// 1. Resolve client IP
-	clientIP := resolveClientIP(req)
+	clientIP := resolveClientIP(req, p.trustedProxyNets)
 
 	// 2. Run lightweight prefilter checks before backend forwarding.
 	rules := p.config.PrefilterRules
 	if p.prefilterConfig != nil {
 		rules = p.prefilterConfig.GetRules()
 	}
-	decision, err := evaluatePrefilter(p.config, rules, p.geoResolver, req)
+	decision, err := evaluatePrefilter(p.config, rules, p.geoResolver, clientIP, req)
 	if err != nil {
 		if p.config.prefilterFailClosed() {
 			decision = prefilterDecision{Matched: true, Rule: "prefilter_error", Reason: "prefilter evaluation failed"}
@@ -347,24 +429,76 @@ func (p *ProtectorMirror) dispatchLoop() {
 
 // resolveClientIP extracts the client IP from X-Forwarded-For (first entry)
 // with fallback to RemoteAddr (port stripped).
-func resolveClientIP(req *http.Request) string {
-	// Try X-Forwarded-For first
-	xff := req.Header.Get("X-Forwarded-For")
-	if xff != "" {
-		// Take first entry (may have multiple comma-separated)
+func resolveClientIP(req *http.Request, trustedProxyNets []*net.IPNet) string {
+	remoteIP := parseRemoteAddrIP(req.RemoteAddr)
+	if remoteIP == nil {
+		return strings.TrimSpace(req.RemoteAddr)
+	}
+
+	if !isTrustedProxy(remoteIP, trustedProxyNets) {
+		return remoteIP.String()
+	}
+
+	if xRealIP := parseHeaderIP(req.Header.Get("X-Real-IP")); xRealIP != nil {
+		return xRealIP.String()
+	}
+
+	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.SplitN(xff, ",", 2)
-		ip := strings.TrimSpace(parts[0])
-		if ip != "" {
-			return ip
+		if xffIP := parseHeaderIP(parts[0]); xffIP != nil {
+			return xffIP.String()
 		}
 	}
 
-	// Fallback: RemoteAddr (strip port)
-	host, _, err := net.SplitHostPort(req.RemoteAddr)
-	if err != nil {
-		return req.RemoteAddr
+	return remoteIP.String()
+}
+
+func parseTrustedProxyCIDRs(cidrStrings []string) ([]*net.IPNet, error) {
+	trusted := make([]*net.IPNet, 0, len(cidrStrings))
+	for _, cidr := range cidrStrings {
+		normalized := strings.TrimSpace(cidr)
+		if normalized == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(normalized)
+		if err != nil {
+			return nil, fmt.Errorf("invalid trusted proxy CIDR %q: %w", normalized, err)
+		}
+		trusted = append(trusted, network)
 	}
-	return host
+	return trusted, nil
+}
+
+func parseRemoteAddrIP(remoteAddr string) net.IP {
+	trimmed := strings.TrimSpace(remoteAddr)
+	if trimmed == "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(trimmed)
+	if err == nil {
+		return net.ParseIP(host)
+	}
+	return net.ParseIP(trimmed)
+}
+
+func parseHeaderIP(value string) net.IP {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	return net.ParseIP(trimmed)
+}
+
+func isTrustedProxy(remoteIP net.IP, trustedProxyNets []*net.IPNet) bool {
+	if remoteIP == nil {
+		return false
+	}
+	for _, network := range trustedProxyNets {
+		if network.Contains(remoteIP) {
+			return true
+		}
+	}
+	return false
 }
 
 // statusCapture wraps http.ResponseWriter to capture the response status code.
@@ -397,4 +531,31 @@ func (sc *statusCapture) Flush() {
 	if f, ok := sc.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack implements http.Hijacker for websocket upgrades.
+func (sc *statusCapture) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := sc.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("underlying ResponseWriter does not implement http.Hijacker")
+	}
+	return h.Hijack()
+}
+
+// Push implements http.Pusher for HTTP/2 server push.
+func (sc *statusCapture) Push(target string, opts *http.PushOptions) error {
+	p, ok := sc.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return p.Push(target, opts)
+}
+
+// CloseNotify implements http.CloseNotifier for compatibility.
+func (sc *statusCapture) CloseNotify() <-chan bool {
+	if c, ok := sc.ResponseWriter.(http.CloseNotifier); ok {
+		return c.CloseNotify()
+	}
+	ch := make(chan bool)
+	return ch
 }
