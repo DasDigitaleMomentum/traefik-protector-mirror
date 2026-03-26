@@ -18,6 +18,7 @@ import (
 type Config struct {
 	CollectorURL        string         `json:"collectorURL"`
 	BlocklistRefreshSec int            `json:"blocklistRefreshSec"`
+	PrefilterRefreshSec int            `json:"prefilterRefreshSec"`
 	APIKey              string         `json:"apiKey"`
 	PrefilterEnabled    bool           `json:"prefilterEnabled"`
 	PrefilterMode       string         `json:"prefilterMode"`
@@ -34,6 +35,7 @@ func CreateConfig() *Config {
 	return &Config{
 		CollectorURL:                       "http://collector:8081",
 		BlocklistRefreshSec:                5,
+		PrefilterRefreshSec:                30,
 		APIKey:                             "",
 		PrefilterEnabled:                   true,
 		PrefilterMode:                      "detect",
@@ -47,13 +49,14 @@ func CreateConfig() *Config {
 
 // ProtectorMirror is the middleware struct.
 type ProtectorMirror struct {
-	next        http.Handler
-	name        string
-	config      *Config
-	blocklist   *Blocklist
-	ipBlocklist *IPBlocklist
-	eventCh     chan []byte
-	httpClient  *http.Client
+	next            http.Handler
+	name            string
+	config          *Config
+	blocklist       *Blocklist
+	ipBlocklist     *IPBlocklist
+	prefilterConfig *PrefilterConfigStore
+	eventCh         chan []byte
+	httpClient      *http.Client
 }
 
 // eventPayload is the JSON sent to the Collector (matches Event Schema in plan.md).
@@ -103,6 +106,10 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	// Start IP blocklist refresh
 	p.ipBlocklist = NewIPBlocklist(config.CollectorURL, config.BlocklistRefreshSec, config.APIKey)
 
+	if config.PrefilterEnabled && strings.TrimSpace(config.CollectorURL) != "" {
+		p.prefilterConfig = NewPrefilterConfigStore(config.CollectorURL, config.PrefilterRefreshSec, config.APIKey, config.PrefilterRules)
+	}
+
 	// Start async event dispatcher
 	go p.dispatchLoop()
 
@@ -115,7 +122,11 @@ func (p *ProtectorMirror) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	clientIP := resolveClientIP(req)
 
 	// 2. Run lightweight prefilter checks before backend forwarding.
-	decision, err := evaluatePrefilter(p.config, req)
+	rules := p.config.PrefilterRules
+	if p.prefilterConfig != nil {
+		rules = p.prefilterConfig.GetRules()
+	}
+	decision, err := evaluatePrefilter(p.config, rules, req)
 	if err != nil {
 		if p.config.prefilterFailClosed() {
 			decision = prefilterDecision{Matched: true, Rule: "prefilter_error", Reason: "prefilter evaluation failed"}

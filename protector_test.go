@@ -140,8 +140,8 @@ func TestServeHTTP_PrefilterEnforce_SyncsCollectorAndReturns403(t *testing.T) {
 		if got := payload["block_reason"]; got != "prefilter" {
 			t.Fatalf("expected block_reason=prefilter, got %v", got)
 		}
-		if got := payload["precheck_rule"]; got == "" {
-			t.Fatalf("expected non-empty precheck_rule, got %v", got)
+		if got := payload["precheck_rule"]; got != "denied_path" {
+			t.Fatalf("expected precheck_rule=denied_path, got %v", got)
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for blocked-event sync")
@@ -236,5 +236,96 @@ func TestServeHTTP_PrefilterDetect_DoesNotBlockAndStillEnqueuesEvent(t *testing.
 		}
 	default:
 		t.Fatal("expected event to be enqueued in detect mode")
+	}
+}
+
+func TestServeHTTP_PrefilterUsesDynamicRulesFromStore(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/blocklist", "/ip-blocklist":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"blocked":[]}`))
+		case "/prefilter-config":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"rules":{"uriLengthMax":2048,"queryLengthMax":2048,"queryParamCountMax":32,"headerValueLengthMax":4096,"deniedPathPrefixes":["/dynamic-block"],"deniedUserAgentSubstrings":[]},"version":"v1","updatedAt":"2026-03-26T12:00:00Z"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := CreateConfig()
+	cfg.CollectorURL = srv.URL
+	cfg.APIKey = "dev-key"
+	cfg.BlocklistRefreshSec = 3600
+	cfg.PrefilterRefreshSec = 3600
+	cfg.PrefilterEnabled = true
+	cfg.PrefilterMode = "enforce"
+	cfg.PrefilterRules = PrefilterRules{
+		URILengthMax:         65535,
+		QueryLengthMax:       65535,
+		QueryParamCountMax:   256,
+		HeaderValueLengthMax: 65535,
+		DeniedPathPrefixes:   []string{},
+		DeniedUserAgentSubs:  []string{},
+	}
+	cfg.SyncToCollectorOnPrefilterHit = false
+	cfg.EmitSyntheticEventOnPrefilterHit = false
+	cfg.AutoBlockFingerprintOnPrefilterHit = false
+
+	h, err := New(context.Background(), http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), cfg, "test")
+	if err != nil {
+		t.Fatalf("New() returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/dynamic-block/now", nil)
+	req.RemoteAddr = "203.0.113.30:3456"
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected dynamic prefilter to block with 403, got %d", rr.Code)
+	}
+}
+
+func TestServeHTTP_PrefilterLegacyFallbackUsesStaticRulesWithoutCollectorURL(t *testing.T) {
+	p := &ProtectorMirror{
+		next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+		config: &Config{
+			CollectorURL:        "",
+			APIKey:              "dev-key",
+			PrefilterEnabled:    true,
+			PrefilterMode:       "enforce",
+			PrefilterFailMode:   "open",
+			PrefilterRefreshSec: 30,
+			PrefilterRules: PrefilterRules{
+				URILengthMax:         2048,
+				QueryLengthMax:       2048,
+				QueryParamCountMax:   32,
+				HeaderValueLengthMax: 4096,
+				DeniedPathPrefixes:   []string{"/legacy-block"},
+				DeniedUserAgentSubs:  []string{},
+			},
+			SyncToCollectorOnPrefilterHit:      false,
+			EmitSyntheticEventOnPrefilterHit:   false,
+			AutoBlockFingerprintOnPrefilterHit: false,
+		},
+		httpClient:  &http.Client{},
+		eventCh:     make(chan []byte, 2),
+		blocklist:   &Blocklist{blocked: map[string]bool{}},
+		ipBlocklist: &IPBlocklist{blocked: map[string]bool{}},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/legacy-block/path", nil)
+	req.RemoteAddr = "203.0.113.40:3456"
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected static legacy prefilter to block with 403, got %d", rr.Code)
 	}
 }

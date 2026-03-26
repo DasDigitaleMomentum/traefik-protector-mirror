@@ -6,15 +6,16 @@ summary: Request interception, fingerprinting, and blocklist enforcement
 testData:
   collectorURL: "http://collector:8081"
   blocklistRefreshSec: 5
+  prefilterRefreshSec: 30
   apiKey: "dev-key"
   prefilterEnabled: true
   prefilterMode: "detect"
   prefilterFailMode: "open"
   prefilterRules:
-    maxURLLength: 4096
-    maxQueryLength: 2048
-    maxQueryParams: 40
-    maxHeaderValueLength: 1024
+    uriLengthMax: 4096
+    queryLengthMax: 2048
+    queryParamCountMax: 40
+    headerValueLengthMax: 1024
     deniedPathPrefixes:
       - "/.env"
       - "/wp-admin/install.php"
