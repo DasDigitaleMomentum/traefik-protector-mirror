@@ -21,11 +21,12 @@ type prefilterConfigEnvelope struct {
 }
 
 type PrefilterConfigStore struct {
-	mu           sync.RWMutex
-	rules        PrefilterRules
-	lastVersion  string
-	collectorURL string
-	apiKey       string
+	mu            sync.RWMutex
+	rules         PrefilterRules
+	fallbackRules PrefilterRules
+	lastVersion   string
+	collectorURL  string
+	apiKey        string
 }
 
 var (
@@ -61,9 +62,10 @@ func NewPrefilterConfigStore(collectorURL string, refreshSec int, apiKey string,
 	}
 
 	s := &PrefilterConfigStore{
-		rules:        preparedInitialRules,
-		collectorURL: collectorURL,
-		apiKey:       apiKey,
+		rules:         preparedInitialRules,
+		fallbackRules: preparedInitialRules,
+		collectorURL:  collectorURL,
+		apiKey:        apiKey,
 	}
 	prefilterConfigRegistry[key] = s
 	prefilterConfigRegistryMu.Unlock()
@@ -151,7 +153,12 @@ func (s *PrefilterConfigStore) refresh() {
 	}
 
 	if isZeroPrefilterRules(parsedRules) {
-		log.Printf("[prefilter-config] zero-value rules object rejected (keeping stale data)")
+		// Collector returned empty rules — reset to operator-provided fallback
+		s.mu.Lock()
+		s.rules = s.fallbackRules
+		s.lastVersion = envelope.Version
+		s.mu.Unlock()
+		log.Printf("[prefilter-config] collector returned zero-value rules; reset to fallback (version=%s)", envelope.Version)
 		return
 	}
 

@@ -18,7 +18,7 @@ func TestPrefilterConfigRefreshSendsAPIKeyHeaderAndQuery(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: defaultPrefilterRules()}
+	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: defaultPrefilterRules(), fallbackRules: defaultPrefilterRules()}
 	s.refresh()
 
 	if gotHeader != "dev-key" {
@@ -87,7 +87,7 @@ func TestPrefilterConfigStoreRefreshKeepsStaleOnError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: defaultPrefilterRules()}
+	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: defaultPrefilterRules(), fallbackRules: defaultPrefilterRules()}
 	s.refresh()
 	mode.Store(1)
 	s.refresh()
@@ -114,7 +114,7 @@ func TestPrefilterConfigStoreRefreshVersionChangeDetection(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: defaultPrefilterRules()}
+	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: defaultPrefilterRules(), fallbackRules: defaultPrefilterRules()}
 
 	s.refresh()
 	r1 := s.GetRules()
@@ -152,7 +152,7 @@ func TestPrefilterConfigStoreRejectsMissingRulesEnvelope(t *testing.T) {
 	defer srv.Close()
 
 	fallback := defaultPrefilterRules()
-	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: fallback}
+	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: fallback, fallbackRules: fallback}
 	s.refresh()
 
 	rules := s.GetRules()
@@ -171,7 +171,7 @@ func TestPrefilterConfigStoreRefreshMergesSparseRulesOntoBaseline(t *testing.T) 
 	fallback := defaultPrefilterRules()
 	fallback.URILengthMax = 4096
 	fallback.DeniedPathPrefixes = []string{"/keep"}
-	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: fallback}
+	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: fallback, fallbackRules: fallback}
 
 	s.refresh()
 	rules := s.GetRules()
@@ -200,7 +200,7 @@ func TestPrefilterConfigStoreRefreshRejectsInvalidRegexKeepsStale(t *testing.T) 
 	if err != nil {
 		t.Fatalf("prepareRulesForStorage fallback error: %v", err)
 	}
-	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: preparedFallback}
+	s := &PrefilterConfigStore{collectorURL: srv.URL, apiKey: "dev-key", rules: preparedFallback, fallbackRules: preparedFallback}
 
 	s.refresh()
 	rules := s.GetRules()
@@ -210,5 +210,57 @@ func TestPrefilterConfigStoreRefreshRejectsInvalidRegexKeepsStale(t *testing.T) 
 	}
 	if len(rules.DeniedPathRegexes) != 0 {
 		t.Fatalf("expected invalid regex update to be rejected, got %+v", rules.DeniedPathRegexes)
+	}
+}
+
+func TestPrefilterConfigStoreZeroValueResetsToFallback(t *testing.T) {
+	var version atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		v := version.Load()
+		if v == 0 {
+			// First: non-zero rules (accepted, merged)
+			_, _ = w.Write([]byte(`{"rules":{"uriLengthMax":8192,"deniedCountries":["CN"]},"version":"v1","updatedAt":"2026-03-26T12:00:00Z"}`))
+		} else {
+			// Second: zero-value rules (should reset to fallback)
+			_, _ = w.Write([]byte(`{"rules":{"uriLengthMax":0,"queryLengthMax":0,"queryParamCountMax":0,"headerValueLengthMax":0,"deniedPathPrefixes":[],"deniedUserAgentSubstrings":[],"deniedCountries":[]},"version":"v2","updatedAt":"2026-03-26T12:00:01Z"}`))
+		}
+	}))
+	defer srv.Close()
+
+	fallback := defaultPrefilterRules()
+	fallback.URILengthMax = 4096
+	fallback.DeniedPathPrefixes = []string{"/original"}
+	preparedFallback, _ := prepareRulesForStorage(fallback)
+
+	s := &PrefilterConfigStore{
+		collectorURL:  srv.URL,
+		apiKey:        "dev-key",
+		rules:         preparedFallback,
+		fallbackRules: preparedFallback,
+	}
+
+	// First refresh — non-zero rules merged onto baseline
+	s.refresh()
+	rules := s.GetRules()
+	if rules.URILengthMax != 8192 {
+		t.Fatalf("expected merged uriLengthMax=8192 after first refresh, got %d", rules.URILengthMax)
+	}
+	if firstOrEmpty(rules.DeniedCountries) != "CN" {
+		t.Fatalf("expected deniedCountries=[CN] after first refresh, got %+v", rules.DeniedCountries)
+	}
+
+	// Second refresh — zero-value should reset to fallback
+	version.Store(1)
+	s.refresh()
+	rules = s.GetRules()
+	if rules.URILengthMax != 4096 {
+		t.Fatalf("expected fallback uriLengthMax=4096 after zero-value reset, got %d", rules.URILengthMax)
+	}
+	if firstOrEmpty(rules.DeniedPathPrefixes) != "/original" {
+		t.Fatalf("expected fallback deniedPathPrefixes=[/original] after zero-value reset, got %+v", rules.DeniedPathPrefixes)
+	}
+	if len(rules.DeniedCountries) != 0 {
+		t.Fatalf("expected no deniedCountries after zero-value reset, got %+v", rules.DeniedCountries)
 	}
 }
